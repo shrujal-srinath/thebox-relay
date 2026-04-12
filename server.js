@@ -98,9 +98,16 @@ function stripPending(stateObj) {
 const httpServer = http.createServer((req, res) => {
     // Health check endpoint — used by Railway and monitoring
     if (req.url === "/health") {
+        let devices = 0, browsers = 0;
+        for (const [, s] of sessions) {
+            if (s.device && s.device.readyState === 1) devices++;
+            browsers += s.browsers.size;
+        }
         const stats = {
             status: "ok",
             sessions: sessions.size,
+            devices,
+            browsers,
             uptime: Math.floor(process.uptime()),
             ts: Date.now(),
         };
