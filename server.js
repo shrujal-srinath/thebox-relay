@@ -58,7 +58,8 @@ const wss = new WebSocket.Server({
 
 wss.on('connection', (ws, req) => {
     const url = req.url || '';
-    console.log(`[relay] New connection: "${url}"`);
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    console.log(`[relay] Incoming: "${url}" from ${ip}`);
 
     // Accept BOTH path formats:
     //   /device/XXXX          — new format (ESP32 v35+, website v2)
@@ -85,17 +86,14 @@ wss.on('connection', (ws, req) => {
     }
 
     if (!roomId) {
-        console.log(`[relay] Rejected — no room ID in: "${url}"`);
+        console.log(`[relay] Rejected — no room ID in: "${url}" from ${ip}`);
         ws.close(4001, 'No room ID found in URL');
         return;
     }
 
     const session = getOrCreateSession(roomId);
 
-    // Determine role:
-    // - If URL declares role=device, use that
-    // - If no existing device, this connection becomes the device
-    // - Otherwise it's a browser
+    // Determine role
     let role;
     if (declaredRole === 'device') {
         role = 'device';
@@ -109,7 +107,7 @@ wss.on('connection', (ws, req) => {
 
     if (role === 'device') {
         session.device = ws;
-        console.log(`[${roomId}] Device connected (url: ${url})`);
+        console.log(`[${roomId}] Device connected (ip: ${ip})`);
     } else {
         session.browsers.add(ws);
         console.log(`[${roomId}] Browser connected (${session.browsers.size} total)`);
@@ -138,7 +136,6 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // Re-identify as device if it sends hello
             if (msg.t === 'hello') {
                 if (role === 'browser') {
                     role = 'device';
@@ -164,10 +161,9 @@ wss.on('connection', (ws, req) => {
                 msgStr = JSON.stringify(msg);
                 s.lastState = msgStr;
             }
-        } catch (e) { /* not JSON, forward anyway */ }
+        } catch (e) { /* not JSON */ }
 
         if (role === 'device') {
-            // Device → all browsers
             let count = 0;
             for (const browser of s.browsers) {
                 if (browser.readyState === WebSocket.OPEN) {
@@ -177,13 +173,8 @@ wss.on('connection', (ws, req) => {
             }
             if (count > 0) console.log(`[${roomId}] Device→${count} browser(s)`);
         } else {
-            // Browser → device
             if (s.device && s.device.readyState === WebSocket.OPEN) {
                 s.device.send(msgStr);
-                const preview = msgStr.slice(0, 100);
-                console.log(`[${roomId}] Browser→Device: ${preview}`);
-            } else {
-                console.log(`[${roomId}] Browser msg but no device connected`);
             }
         }
     });
@@ -199,6 +190,10 @@ wss.on('connection', (ws, req) => {
             console.log(`[${roomId}] Browser disconnected (${s.browsers.size} remaining)`);
         }
         cleanupSession(roomId);
+    });
+
+    ws.on('unexpected-response', (req, res) => {
+        console.log(`[${roomId}] HTTP Error during handshake: ${res.statusCode}`);
     });
 
     ws.on('error', (err) => {
