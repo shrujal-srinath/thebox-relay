@@ -1,13 +1,6 @@
 /*
- * THE BOX — Relay Server v2.0
- * Deployed on Railway at thebox-relay-production.up.railway.app
- *
- * URL format:  wss://host/device/XXXX
- *   - Both ESP32 and browser connect to the SAME path
- *   - First connection to a room = stored as device or browser based on
- *     whether it sends a hello with t="hello" or just connects
- *   - All messages forwarded to every OTHER member of the room
- *   - /health returns session count, device count, browser count
+ * THE BOX — Relay Server v3.0
+ * thebox-relay-production.up.railway.app
  */
 
 const WebSocket = require('ws');
@@ -30,7 +23,7 @@ function cleanupSession(roomId) {
     if (!s) return;
     if (!s.device && s.browsers.size === 0) {
         sessions.delete(roomId);
-        console.log(`[${roomId}] Session cleaned up`);
+        console.log(`[${roomId}] Session removed`);
     }
 }
 
@@ -59,25 +52,58 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-    // URL format: /device/XXXX  (4-char room code)
-    const match = req.url?.match(/^\/device\/([A-Z0-9]{4})$/i);
-    if (!match) {
-        console.log(`[relay] Rejected bad path: ${req.url}`);
-        ws.close(4001, 'Invalid path — use /device/XXXX');
+    const url = req.url || '';
+    console.log(`[relay] New connection: "${url}"`);
+
+    // Accept BOTH path formats:
+    //   /device/XXXX          — new format (ESP32 v35+, website v2)
+    //   /?role=device&id=XXXX — old format (backwards compat)
+    //   /?role=browser&id=XXXX
+    let roomId = null;
+    let declaredRole = null;
+
+    // Try new format first: /device/XXXX
+    const newMatch = url.match(/\/device\/([A-Z0-9]{3,6})/i);
+    if (newMatch) {
+        roomId = newMatch[1].toUpperCase();
+    }
+
+    // Try old format: ?role=xxx&id=XXXX or ?id=XXXX&role=xxx
+    if (!roomId) {
+        const idMatch = url.match(/[?&]id=([A-Z0-9]{3,6})/i);
+        const roleMatch = url.match(/[?&]role=(device|browser)/i);
+        if (idMatch) {
+            roomId = idMatch[1].toUpperCase();
+            if (roleMatch) declaredRole = roleMatch[1].toLowerCase();
+        }
+    }
+
+    if (!roomId) {
+        console.log(`[relay] Rejected — no room ID in: "${url}"`);
+        ws.close(4001, 'No room ID found in URL');
         return;
     }
 
-    const roomId = match[1].toUpperCase();
     const session = getOrCreateSession(roomId);
 
-    // Determine role: first connection with no existing device = device
-    // Any connection when device exists = browser
-    // (ESP32 connects first, then browsers join)
-    let role = 'browser';
-    if (!session.device || session.device.readyState !== WebSocket.OPEN) {
+    // Determine role:
+    // - If URL declares role=device, use that
+    // - If no existing device, this connection becomes the device
+    // - Otherwise it's a browser
+    let role;
+    if (declaredRole === 'device') {
         role = 'device';
+    } else if (declaredRole === 'browser') {
+        role = 'browser';
+    } else if (!session.device || session.device.readyState !== WebSocket.OPEN) {
+        role = 'device';
+    } else {
+        role = 'browser';
+    }
+
+    if (role === 'device') {
         session.device = ws;
-        console.log(`[${roomId}] Device connected`);
+        console.log(`[${roomId}] Device connected (url: ${url})`);
     } else {
         session.browsers.add(ws);
         console.log(`[${roomId}] Browser connected (${session.browsers.size} total)`);
@@ -89,44 +115,43 @@ wss.on('connection', (ws, req) => {
 
         try {
             const msg = JSON.parse(data.toString());
-
-            // If ESP32 sends hello, confirm it as device role
+            // Re-identify as device if it sends hello
             if (msg.t === 'hello' && role === 'browser') {
-                // This is actually the device reconnecting — reassign
                 role = 'device';
                 s.browsers.delete(ws);
                 s.device = ws;
-                console.log(`[${roomId}] Device re-identified via hello`);
+                console.log(`[${roomId}] Re-identified as device via hello`);
             }
-        } catch (e) {
-            // Not JSON — forward raw
-        }
+        } catch (e) { /* not JSON, forward anyway */ }
 
         if (role === 'device') {
-            // Device → forward to ALL browsers
+            // Device → all browsers
+            let count = 0;
             for (const browser of s.browsers) {
                 if (browser.readyState === WebSocket.OPEN) {
                     browser.send(data);
+                    count++;
                 }
             }
+            if (count > 0) console.log(`[${roomId}] Device→${count} browser(s)`);
         } else {
-            // Browser → forward to device
+            // Browser → device
             if (s.device && s.device.readyState === WebSocket.OPEN) {
                 s.device.send(data);
-                console.log(`[${roomId}] Browser→Device: ${data.toString().slice(0, 80)}`);
+                const preview = data.toString().slice(0, 100);
+                console.log(`[${roomId}] Browser→Device: ${preview}`);
             } else {
-                console.log(`[${roomId}] Browser sent message but no device connected`);
+                console.log(`[${roomId}] Browser msg but no device connected`);
             }
         }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
         const s = sessions.get(roomId);
         if (!s) return;
-
         if (role === 'device') {
             s.device = null;
-            console.log(`[${roomId}] Device disconnected`);
+            console.log(`[${roomId}] Device disconnected (code:${code})`);
         } else {
             s.browsers.delete(ws);
             console.log(`[${roomId}] Browser disconnected (${s.browsers.size} remaining)`);
@@ -135,19 +160,21 @@ wss.on('connection', (ws, req) => {
     });
 
     ws.on('error', (err) => {
-        console.log(`[${roomId}] WS error (${role}): ${err.message}`);
+        console.log(`[${roomId}] Error (${role}): ${err.message}`);
     });
 
-    // Heartbeat ping every 25s to keep Railway proxy alive
+    // Ping every 20s to keep Railway proxy alive
     const ping = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
             ws.ping();
         } else {
             clearInterval(ping);
         }
-    }, 25000);
+    }, 20000);
+
+    ws.on('close', () => clearInterval(ping));
 });
 
 server.listen(PORT, () => {
-    console.log(`[relay] THE BOX relay v2.0 on port ${PORT}`);
+    console.log(`[relay] THE BOX relay v3.0 listening on port ${PORT}`);
 });
