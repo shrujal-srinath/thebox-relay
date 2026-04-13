@@ -52,6 +52,12 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({
     server,
     perMessageDeflate: false, // ESP32 doesn't handle compression well
+    handleProtocols: (protocols, req) => {
+        // Echo back whatever protocol the client sent (ESP32 sends "arduino").
+        // Return undefined (not false) when no protocol is sent — returning false
+        // causes ws to reject with HTTP 401, which the ESP32 reads as a timeout.
+        return protocols.size > 0 ? protocols.values().next().value : undefined;
+    }
 });
 
 wss.on('connection', (ws, req) => {
