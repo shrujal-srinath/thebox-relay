@@ -1,0 +1,4 @@
+node_modules
+box firmware/
+*.log
+.DS_Store

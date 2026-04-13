@@ -13,7 +13,7 @@ const sessions = new Map();
 
 function getOrCreateSession(roomId) {
     if (!sessions.has(roomId)) {
-        sessions.set(roomId, { device: null, browsers: new Set() });
+        sessions.set(roomId, { device: null, browsers: new Set(), lastState: null, lastSeq: -1 });
     }
     return sessions.get(roomId);
 }
@@ -49,7 +49,12 @@ const server = http.createServer((req, res) => {
     res.end('WebSocket connections only');
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+    server,
+    handleProtocols: (protocols, req) => {
+        return protocols.size ? protocols.values().next().value : false;
+    }
+});
 
 wss.on('connection', (ws, req) => {
     const url = req.url || '';
@@ -66,6 +71,7 @@ wss.on('connection', (ws, req) => {
     const newMatch = url.match(/\/device\/([A-Z0-9]{3,6})/i);
     if (newMatch) {
         roomId = newMatch[1].toUpperCase();
+        declaredRole = 'device';
     }
 
     // Try old format: ?role=xxx&id=XXXX or ?id=XXXX&role=xxx
@@ -107,20 +113,56 @@ wss.on('connection', (ws, req) => {
     } else {
         session.browsers.add(ws);
         console.log(`[${roomId}] Browser connected (${session.browsers.size} total)`);
+        if (session.lastState) {
+            try {
+                const cached = JSON.parse(session.lastState);
+                cached.cached = true;
+                ws.send(JSON.stringify(cached));
+            } catch(e) {
+                ws.send(session.lastState);
+            }
+        }
     }
 
     ws.on('message', (data) => {
         const s = sessions.get(roomId);
         if (!s) return;
 
+        let msgStr = data.toString();
+
         try {
-            const msg = JSON.parse(data.toString());
+            const msg = JSON.parse(msgStr);
+            
+            if (msg.t === 'ping') {
+                ws.send(JSON.stringify({ t: 'pong', ts: msg.ts }));
+                return;
+            }
+
             // Re-identify as device if it sends hello
-            if (msg.t === 'hello' && role === 'browser') {
-                role = 'device';
-                s.browsers.delete(ws);
-                s.device = ws;
-                console.log(`[${roomId}] Re-identified as device via hello`);
+            if (msg.t === 'hello') {
+                if (role === 'browser') {
+                    role = 'device';
+                    s.browsers.delete(ws);
+                    s.device = ws;
+                    console.log(`[${roomId}] Re-identified as device via hello`);
+                }
+                return;
+            }
+
+            if (role === 'device' && msg.t === 'state') {
+                if (typeof msg.seq === 'number') {
+                    if (msg.seq <= s.lastSeq) {
+                        return; // drop stale sequence
+                    }
+                    s.lastSeq = msg.seq;
+                }
+
+                if (msg.pending !== undefined) {
+                    delete msg.pending;
+                }
+                
+                msgStr = JSON.stringify(msg);
+                s.lastState = msgStr;
             }
         } catch (e) { /* not JSON, forward anyway */ }
 
@@ -129,7 +171,7 @@ wss.on('connection', (ws, req) => {
             let count = 0;
             for (const browser of s.browsers) {
                 if (browser.readyState === WebSocket.OPEN) {
-                    browser.send(data);
+                    browser.send(msgStr);
                     count++;
                 }
             }
@@ -137,8 +179,8 @@ wss.on('connection', (ws, req) => {
         } else {
             // Browser → device
             if (s.device && s.device.readyState === WebSocket.OPEN) {
-                s.device.send(data);
-                const preview = data.toString().slice(0, 100);
+                s.device.send(msgStr);
+                const preview = msgStr.slice(0, 100);
                 console.log(`[${roomId}] Browser→Device: ${preview}`);
             } else {
                 console.log(`[${roomId}] Browser msg but no device connected`);
