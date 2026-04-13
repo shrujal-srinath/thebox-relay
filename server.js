@@ -51,6 +51,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ 
     server,
+    perMessageDeflate: false, // ESP32 doesn't handle compression well
     handleProtocols: (protocols, req) => {
         return protocols.size ? protocols.values().next().value : false;
     }
